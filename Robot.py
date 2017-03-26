@@ -115,18 +115,16 @@ class Robot(Link):
 
     def forward_kinematic(self, id):
         """ Forward Kinematic robot"""
-        if id is None:
-            return
+        if id is not None:
+            if id != 0:
+                mom = self.links[id].mother
+                T_i = self.dh_to_trans_mat(self.links[id].dh, self.links[id].q)
+                self.links[id].T = num.dot(self.links[mom].T, T_i)
+                self.links[id].p = self.links[id].T[0:3][:, 3:4]
+                self.links[id].R = self.links[id].T[0:3][:, 0:3]
 
-        if id != 0:
-            mom = self.links[id].mother
-            T_i = self.dh_to_trans_mat(self.links[id].dh, self.links[id].q)
-            self.links[id].T = num.dot(self.links[mom].T, T_i)
-            self.links[id].p = self.links[id].T[0:3][:, 3:4]
-            self.links[id].R = self.links[id].T[0:3][:, 0:3]
-
-        self.forward_kinematic(self.links[id].sister)
-        self.forward_kinematic(self.links[id].child)
+            self.forward_kinematic(self.links[id].sister)
+            self.forward_kinematic(self.links[id].child)
 
     def find_route(self, lk_id, idx = []):
         """
@@ -153,15 +151,111 @@ class Robot(Link):
         j_size = len(chain)
         target = (self.links[chain[-1]]).p
         J = num.zeros((6, j_size))
-
         for index in range(j_size):
             j = chain[index]
-            a = self.links[j].T[0:3][:, 3:4]
+            a = self.links[j].T[0:3][:, 2:3]
+            J[:, index] = num.append(num.cross(a, target - self.links[j].p, axis=0), a)
+        return J
 
+    def cal_total_mass(self, lk_id):
+        """
+        Function calculate total of mass
+        :param lk_id:
+        :return: Total of mass
+        """
+        if lk_id is None:
+            m = 0
+        else:
+            m = self.links[lk_id].m + self.cal_total_mass(self.links[lk_id].sister) + self.cal_total_mass(self.links[lk_id].child)
 
+        return m
+
+    def inverse_kinematic(self, pos_ref: Link, pos_now: Link):
+        """
+        Function calculate posture error
+        :param pos_ref:
+        :param pos_now:
+        :return:
+        """
+        chain = self.find_route(pos_now.id)
+        chain = chain[::-1]  # Reverse order
+        #  Default value
+        treshold = 10**-12
+        max_iter = 50
+        lamda_max = 0.09  # Variable damping
+        beta = 0.001  # Isotropic damping
+        epsilon = 0.001  # Singular region size
+
+        iter_taken = 1
+        dofs = len(chain)
+
+        while True:
+            iter_taken = iter_taken + 1
+            jac = self.cal_jacobian(chain)
+            posture_error = self.cal_posture_error(pos_ref, pos_now)
+            norm_err = num.linalg.norm(posture_error)
+            U, s, V = num.linalg.svd(jac, full_matrices=True)
+            sigma_min = s[-1]
+            u_m = U[:, 0:dofs][:, dofs-1:dofs]  # get column dofs-1 of matrix U
+            lamda = lamda_max
+            if sigma_min < epsilon:
+                lamda = (1 - (sigma_min/epsilon)**2)*(lamda_max**2)
+            jac_inv = num.dot(jac.T, num.linalg.inv(num.dot(jac, jac.T) + lamda ** 2 * num.eye(dofs) + beta ** 2 * num.dot(u_m, u_m.T)))
+            dq = num.dot(jac_inv, posture_error)
+            dq = dq.ravel()
+
+            self.move_joints(chain, dq)
+            self.forward_kinematic(0)
+
+            if (iter_taken > max_iter) or (norm_err < treshold):
+                break
+
+    def cal_posture_error(self, pos_ref: Link, pos_now: Link):
+        """
+        Function calculate posture error
+        :param pos_ref:
+        :param pos_now:
+        :return:
+        """
+        posture_err = num.zeros((6, 1))
+        pos_err = pos_ref.p - pos_now.p
+
+        ori_err = num.dot(num.linalg.inv(pos_now.R), pos_ref.R)
+        ome_err = num.dot(pos_now.R, self.rot2omega(ori_err))
+        posture_err[:, 0] = num.append(pos_err, ome_err)
+        return posture_err
+
+    def rot2omega(self, r_mat):
+        """
+        Function convert rotate matrix to omega
+        :param r_mat:
+        :return: omega
+        """
+        alpha = (num.trace(r_mat)-1)/2
+        if num.abs(alpha - 1) < num.finfo(float).eps:
+            w = num.zeros((3, 1))
+            return w
+        th = num.arccos(alpha)
+        w = 0.5*th/num.sin(th)*num.array([[r_mat[2, 1] - r_mat[1, 2]],
+                                [r_mat[0, 2] - r_mat[2, 0]],
+                                [r_mat[1, 0] - r_mat[0, 1]]])
+        return w
+
+    def move_joints(self, chain, jnt_angle):
+        """
+        Function move joint
+        :param chain:
+        :param jnt_angle:
+        :return:
+        """
+        for index in range(len(chain)):
+            j = chain[index]
+            self.links[j].q = self.links[j].q + jnt_angle[index]
+            self.links[j].q = num.minimum(self.links[j].ub, num.maximum(self.links[j].q, self.links[j].lb))
 
 
     """PLOT FUCNTION LIST"""
+
     def draw_polygon(self, vert, face, col, axis):
         """
         Function drawing 3D polygon
@@ -216,13 +310,15 @@ class Robot(Link):
 
         # make some vector not in the same direction as v
         not_v = num.array([1, 0, 0])
-        if (v == not_v).all():
-            not_v = num.array([0, 1, 0])
-
         # make vector perpendicular to v
         n1 = num.cross(v, not_v)
+        if norm(n1) < 10**-9:
+            not_v = num.array([0, 1, 0])
+        n1 = num.cross(v, not_v)
+
         # normalize n1
-        n1 /= norm(n1)
+
+        n1 = n1/norm(n1)
 
         # make unit vector perpendicular to v and n1
         n2 = num.cross(v, n1)
@@ -234,9 +330,7 @@ class Robot(Link):
 
         # use meshgrid to make 2d arrays
         t, theta2 = num.meshgrid(t, theta)
-
         rsample, theta = num.meshgrid(rsample, theta)
-
         # generate coordinates for surface
         # "Tube"
         X, Y, Z = [p0[i] + v[i] * t + radius * num.sin(theta2) * n1[i] + radius * num.cos(theta2) * n2[i] for i in [0, 1, 2]]
